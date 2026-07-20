@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: petshop-prado
+    env: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /api/status
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 3000
+    disks:
+      - name: petshop-data
+        mountPath: /opt/render/project/src/data
+        sizeGB: 1
