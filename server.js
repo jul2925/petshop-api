@@ -233,7 +233,20 @@ app.use(express.static(path.join(__dirname)));
 
 // Rota fallback - servir index.html
 app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, 'index.html'));
+  const indexPath = path.join(__dirname, 'index.html');
+  if (fs.existsSync(indexPath)) {
+    res.sendFile(indexPath);
+  } else {
+    res.status(200).json({ 
+      status: 'online',
+      message: 'PetShop Prado API esta funcionando. Acesse /api/status para mais informacoes.',
+      endpoints: {
+        load: '/api/load',
+        save: '/api/save', 
+        status: '/api/status'
+      }
+    });
+  }
 });
 
 // ===== INICIAR SERVIDOR =====
