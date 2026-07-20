@@ -2,25 +2,26 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'petshop-prado-secret-key-2024';
+const JWT_EXPIRES = '7d';
+const BCRYPT_ROUNDS = 10;
 
-// ===== MIDDLEWARE =====
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
-// ===== ARQUIVO DE DADOS =====
 const DB_FILE = path.join(__dirname, 'data', 'petshop.json');
 const DATA_DIR = path.join(__dirname, 'data');
 
-// Criar pasta data se nao existir
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-// ===== DADOS PADRAO =====
 const DEFAULT_DB = {
   products: [
     {id:1,name:'Racao Premium Cao Adulto 15kg',cat:'Alimentacao',price:189.90,stock:40,minStock:8,unit:'kg',barcode:'7891000001001',emoji:'🐕'},
@@ -69,11 +70,7 @@ const DEFAULT_DB = {
     {id:2,name:'Maria Santos',role:'Estoque',shift:'Tarde',salary:2400,active:true,phone:'(11)99999-2222'},
     {id:3,name:'Joao Oliveira',role:'Gerente',shift:'Manha',salary:4500,active:true,phone:'(11)99999-3333'}
   ],
-  users: [
-    {id:1,username:'admin',password:'admin123',name:'Administrador Geral',type:'admin',active:true},
-    {id:2,username:'func',password:'func123',name:'Funcionario Teste',type:'func',active:true},
-    {id:3,username:'cliente',password:'cli123',name:'Cliente Teste',type:'cliente',active:true}
-  ],
+  users: [],
   clients: [
     {id:1,name:'Joao Pereira',phone:'(11)98888-1001',cpf:'123.456.789-00',email:'joao@email.com',address:'Rua das Flores, 100 - SP',active:true,dogs:[]},
     {id:2,name:'Ana Beatriz',phone:'(11)98888-1002',cpf:'987.654.321-00',email:'ana@email.com',address:'Av. Brasil, 200 - SP',active:true,dogs:[{name:'Rex',breed:'Labrador',age:3,color:'Dourado'}]},
@@ -97,51 +94,23 @@ const DEFAULT_DB = {
     pixKey: '',
     pixName: 'PetShop Prado',
     pixCity: 'Sao Paulo',
-    scale: {
-      mode: 'serial',
-      protocol: 'toledo',
-      baudRate: 9600,
-      dataBits: 8,
-      stopBits: 1,
-      parity: 'none',
-      unitDefault: 'kg',
-      stableTimeout: 2000,
-      decimals: 3
-    },
-    company: {
-      name: '',
-      fantasyName: '',
-      cnpj: '',
-      cpf: '',
-      ie: '',
-      im: '',
-      address: '',
-      number: '',
-      complement: '',
-      neighborhood: '',
-      city: '',
-      state: '',
-      zip: '',
-      phone: '',
-      phone2: '',
-      email: '',
-      website: '',
-      activity: '',
-      logo: '',
-      motto: ''
-    }
+    scale: { mode:'serial', protocol:'toledo', baudRate:9600, dataBits:8, stopBits:1, parity:'none', unitDefault:'kg', stableTimeout:2000, decimals:3 },
+    company: { name:'', fantasyName:'', cnpj:'', cpf:'', ie:'', im:'', address:'', number:'', complement:'', neighborhood:'', city:'', state:'', zip:'', phone:'', phone2:'', email:'', website:'', activity:'', logo:'', motto:'' }
   }
 };
 
-// ===== FUNCOES DE ARQUIVO =====
+const DEFAULT_USERS = [
+  {id:1,username:'admin',password:'admin123',name:'Administrador Geral',type:'admin',active:true},
+  {id:2,username:'func',password:'func123',name:'Funcionario Teste',type:'func',active:true},
+  {id:3,username:'cliente',password:'cli123',name:'Cliente Teste',type:'cliente',active:true}
+];
+
 function loadFromFile() {
   try {
     if (fs.existsSync(DB_FILE)) {
       const raw = fs.readFileSync(DB_FILE, 'utf8');
       const data = JSON.parse(raw);
-      if (data && data.products) {
-        return data;
-      }
+      if (data && data.products) return data;
     }
   } catch (e) {
     console.error('[ERRO] Ao ler arquivo:', e.message);
@@ -151,10 +120,8 @@ function loadFromFile() {
 
 function saveToFile(data) {
   try {
-    // Backup do arquivo anterior
     if (fs.existsSync(DB_FILE)) {
-      const backupFile = path.join(DATA_DIR, 'petshop.backup.json');
-      fs.copyFileSync(DB_FILE, backupFile);
+      fs.copyFileSync(DB_FILE, path.join(DATA_DIR, 'petshop.backup.json'));
     }
     fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf8');
     return true;
@@ -164,17 +131,237 @@ function saveToFile(data) {
   }
 }
 
-// ===== ROTAS DA API =====
+async function initDefaultUsers() {
+  let data = loadFromFile();
+  if (!data) {
+    data = Object.assign({}, DEFAULT_DB);
+    data.users = [];
+    saveToFile(data);
+  }
 
-// GET /api/load - Carregar dados
-app.get('/api/load', (req, res) => {
+  if (!data.users) data.users = [];
+  if (!data.nextUserId) data.nextUserId = 1;
+
+  for (const defUser of DEFAULT_USERS) {
+    const exists = data.users.find(u => u.username === defUser.username);
+    if (!exists) {
+      const hashedPassword = await bcrypt.hash(defUser.password, BCRYPT_ROUNDS);
+      data.users.push({
+        id: data.nextUserId++,
+        username: defUser.username,
+        password: hashedPassword,
+        name: defUser.name,
+        type: defUser.type,
+        active: defUser.active
+      });
+      console.log(`[INIT] Usuario "${defUser.username}" criado com senha hasheada`);
+    } else {
+      const isHashed = exists.password && exists.password.startsWith('$2');
+      if (!isHashed) {
+        exists.password = await bcrypt.hash(exists.password, BCRYPT_ROUNDS);
+        console.log(`[INIT] Senha de "${defUser.username}" hasheada pela primeira vez`);
+      }
+    }
+  }
+  saveToFile(data);
+  console.log(`[INIT] ${data.users.length} usuarios verificados no banco`);
+}
+
+function generateToken(user) {
+  return jwt.sign(
+    { id: user.id, username: user.username, type: user.type, name: user.name },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES }
+  );
+}
+
+function authMiddleware(req, res, next) {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ error: 'Token de autenticacao necessario' });
+  }
+  const token = authHeader.split(' ')[1];
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ error: 'Token invalido ou expirado' });
+  }
+}
+
+function adminOnly(req, res, next) {
+  if (req.user.type !== 'admin') {
+    return res.status(403).json({ error: 'Acesso restrito a administradores' });
+  }
+  next();
+}
+
+function removePassword(user) {
+  const u = Object.assign({}, user);
+  delete u.password;
+  return u;
+}
+
+// ===== PUBLIC ROUTES =====
+
+app.get('/api/status', (req, res) => {
+  const data = loadFromFile();
+  res.json({
+    status: 'online',
+    version: '2.0.0',
+    products: data ? data.products.length : 0,
+    users: data ? data.users.length : 0,
+    clients: data ? data.clients.length : 0,
+    sales: data ? data.sales.length : 0,
+    uptime: process.uptime(),
+    memory: process.memoryUsage(),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+    if (!username || !password) {
+      return res.status(400).json({ error: 'Usuario e senha sao obrigatorios' });
+    }
+
+    let data = loadFromFile();
+    if (!data) {
+      data = Object.assign({}, DEFAULT_DB);
+      data.users = [];
+      saveToFile(data);
+    }
+
+    const user = (data.users || []).find(u => u.username === username && u.active);
+    if (!user) {
+      return res.status(401).json({ error: 'Usuario ou senha invalidos' });
+    }
+
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Usuario ou senha invalidos' });
+    }
+
+    const token = generateToken(user);
+
+    console.log(`[LOGIN] ${user.username} (${user.type}) logado com sucesso`);
+
+    res.json({
+      token,
+      user: removePassword(user)
+    });
+  } catch (e) {
+    console.error('[ERRO] /api/auth/login:', e.message);
+    res.status(500).json({ error: 'Erro ao fazer login' });
+  }
+});
+
+app.post('/api/auth/validate', (req, res) => {
+  const { token } = req.body;
+  if (!token) {
+    return res.status(400).json({ valid: false });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    let data = loadFromFile();
+    if (!data) return res.json({ valid: false });
+    const user = (data.users || []).find(u => u.id === decoded.id && u.active);
+    if (!user) return res.json({ valid: false });
+    res.json({ valid: true, user: removePassword(user) });
+  } catch (e) {
+    res.json({ valid: false });
+  }
+});
+
+app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Senha atual e nova senha sao obrigatorias' });
+    }
+    if (newPassword.length < 4) {
+      return res.status(400).json({ error: 'Nova senha deve ter pelo menos 4 caracteres' });
+    }
+
+    let data = loadFromFile();
+    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
+
+    const user = (data.users || []).find(u => u.id === req.user.id);
+    if (!user) return res.status(404).json({ error: 'Usuario nao encontrado' });
+
+    const valid = await bcrypt.compare(currentPassword, user.password);
+    if (!valid) return res.status(401).json({ error: 'Senha atual incorreta' });
+
+    user.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
+    saveToFile(data);
+
+    console.log(`[AUTH] ${user.username} alterou a senha`);
+    res.json({ ok: true, message: 'Senha alterada com sucesso' });
+  } catch (e) {
+    console.error('[ERRO] /api/auth/change-password:', e.message);
+    res.status(500).json({ error: 'Erro ao alterar senha' });
+  }
+});
+
+app.post('/api/auth/create-user', authMiddleware, adminOnly, async (req, res) => {
+  try {
+    const { username, password, name, type } = req.body;
+    if (!username || !password || !name || !type) {
+      return res.status(400).json({ error: 'Todos os campos sao obrigatorios' });
+    }
+    if (!['admin', 'func', 'cliente'].includes(type)) {
+      return res.status(400).json({ error: 'Tipo de usuario invalido' });
+    }
+    if (password.length < 4) {
+      return res.status(400).json({ error: 'Senha deve ter pelo menos 4 caracteres' });
+    }
+
+    let data = loadFromFile();
+    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
+    if (!data.users) data.users = [];
+    if (!data.nextUserId) data.nextUserId = 1;
+
+    const exists = data.users.find(u => u.username === username);
+    if (exists) return res.status(400).json({ error: 'Nome de usuario ja existe' });
+
+    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    const newUser = {
+      id: data.nextUserId++,
+      username,
+      password: hashedPassword,
+      name,
+      type,
+      active: true
+    };
+    data.users.push(newUser);
+    saveToFile(data);
+
+    console.log(`[ADMIN] Novo usuario "${username}" (${type}) criado por ${req.user.username}`);
+    res.json({ ok: true, user: removePassword(newUser) });
+  } catch (e) {
+    console.error('[ERRO] /api/auth/create-user:', e.message);
+    res.status(500).json({ error: 'Erro ao criar usuario' });
+  }
+});
+
+// ===== PROTECTED DATA ROUTES =====
+
+app.get('/api/load', authMiddleware, (req, res) => {
   try {
     let data = loadFromFile();
     if (!data) {
-      console.log('[INFO] Nenhum arquivo encontrado, criando com dados padrao...');
-      data = DEFAULT_DB;
+      data = Object.assign({}, DEFAULT_DB);
+      data.users = [];
       saveToFile(data);
     }
+
+    const sensitiveFields = ['password'];
+    if (req.user.type !== 'admin') {
+      delete data.activityLog;
+    }
+
     res.json(data);
   } catch (e) {
     console.error('[ERRO] /api/load:', e.message);
@@ -182,13 +369,18 @@ app.get('/api/load', (req, res) => {
   }
 });
 
-// POST /api/save - Salvar dados
-app.post('/api/save', (req, res) => {
+app.post('/api/save', authMiddleware, (req, res) => {
   try {
     const data = req.body;
     if (!data || !data.products) {
       return res.status(400).json({ error: 'Dados invalidos' });
     }
+
+    if (req.user.type !== 'admin') {
+      if (data.settings) delete data.settings;
+      if (data.activityLog) delete data.activityLog;
+    }
+
     const saved = saveToFile(data);
     if (saved) {
       res.json({ ok: true, message: 'Dados salvos com sucesso' });
@@ -201,66 +393,124 @@ app.post('/api/save', (req, res) => {
   }
 });
 
-// GET /api/status - Status do servidor
-app.get('/api/status', (req, res) => {
-  const data = loadFromFile();
-  res.json({
-    status: 'online',
-    version: '1.0.0',
-    products: data ? data.products.length : 0,
-    users: data ? data.users.length : 0,
-    clients: data ? data.clients.length : 0,
-    sales: data ? data.sales.length : 0,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    timestamp: new Date().toISOString()
-  });
+app.get('/api/users', authMiddleware, adminOnly, (req, res) => {
+  try {
+    let data = loadFromFile();
+    if (!data || !data.users) return res.json([]);
+    const safeUsers = data.users.map(u => removePassword(u));
+    res.json(safeUsers);
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao listar usuarios' });
+  }
 });
 
-// DELETE /api/reset - Resetar dados (cuidado!)
-app.delete('/api/reset', (req, res) => {
+app.put('/api/users/:id', authMiddleware, adminOnly, async (req, res) => {
   try {
-    saveToFile(DEFAULT_DB);
-    console.log('[AVISO] Dados resetados!');
+    const userId = parseInt(req.params.id);
+    const { name, type, active, password } = req.body;
+
+    let data = loadFromFile();
+    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
+
+    const user = (data.users || []).find(u => u.id === userId);
+    if (!user) return res.status(404).json({ error: 'Usuario nao encontrado' });
+
+    if (name) user.name = name;
+    if (type && ['admin', 'func', 'cliente'].includes(type)) user.type = type;
+    if (active !== undefined) user.active = active;
+    if (password && password.length >= 4) {
+      user.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
+    }
+
+    saveToFile(data);
+    console.log(`[ADMIN] Usuario "${user.username}" atualizado por ${req.user.username}`);
+    res.json({ ok: true, user: removePassword(user) });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao atualizar usuario' });
+  }
+});
+
+app.delete('/api/users/:id', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const userId = parseInt(req.params.id);
+    let data = loadFromFile();
+    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
+
+    const user = (data.users || []).find(u => u.id === userId);
+    if (!user) return res.status(404).json({ error: 'Usuario nao encontrado' });
+    if (user.id === req.user.id) return res.status(400).json({ error: 'Nao e possivel excluir seu proprio usuario' });
+
+    user.active = false;
+    saveToFile(data);
+    console.log(`[ADMIN] Usuario "${user.username}" desativado por ${req.user.username}`);
+    res.json({ ok: true, message: 'Usuario desativado' });
+  } catch (e) {
+    res.status(500).json({ error: 'Erro ao excluir usuario' });
+  }
+});
+
+app.delete('/api/reset', authMiddleware, adminOnly, (req, res) => {
+  try {
+    const data = Object.assign({}, DEFAULT_DB);
+    data.users = [];
+    saveToFile(data);
+    initDefaultUsers();
+    console.log(`[ADMIN] Dados resetados por ${req.user.username}`);
     res.json({ ok: true, message: 'Dados resetados para padrao' });
   } catch (e) {
     res.status(500).json({ error: 'Erro ao resetar dados' });
   }
 });
 
-// ===== SERVIR ARQUIVOS ESTATICOS =====
+// ===== STATIC FILES =====
 app.use(express.static(path.join(__dirname)));
 
-// Rota fallback - servir index.html
 app.get('*', (req, res) => {
   const indexPath = path.join(__dirname, 'index.html');
   if (fs.existsSync(indexPath)) {
     res.sendFile(indexPath);
   } else {
-    res.status(200).json({ 
+    res.status(200).json({
       status: 'online',
-      message: 'PetShop Prado API esta funcionando. Acesse /api/status para mais informacoes.',
+      message: 'PetShop Prado API v2.0 - Autenticacao JWT ativa',
       endpoints: {
-        load: '/api/load',
-        save: '/api/save', 
-        status: '/api/status'
+        login: 'POST /api/auth/login',
+        validate: 'POST /api/auth/validate',
+        load: 'GET /api/load (requer token)',
+        save: 'POST /api/save (requer token)',
+        status: 'GET /api/status'
       }
     });
   }
 });
 
-// ===== INICIAR SERVIDOR =====
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('========================================');
-  console.log('   PetShop Prado - Servidor API');
-  console.log('========================================');
-  console.log(`Porta: ${PORT}`);
-  console.log(`Arquivo DB: ${DB_FILE}`);
-  console.log(`Ambiente: ${process.env.NODE_ENV || 'desenvolvimento'}`);
-  console.log('========================================');
-  console.log('Endpoints:');
-  console.log('  GET  /api/load   - Carregar dados');
-  console.log('  POST /api/save   - Salvar dados');
-  console.log('  GET  /api/status - Status do servidor');
-  console.log('========================================');
+// ===== START =====
+initDefaultUsers().then(() => {
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log('========================================');
+    console.log('   PetShop Prado - API v2.0 JWT');
+    console.log('========================================');
+    console.log(`Porta: ${PORT}`);
+    console.log(`Arquivo DB: ${DB_FILE}`);
+    console.log(`Ambiente: ${process.env.NODE_ENV || 'desenvolvimento'}`);
+    console.log(`JWT Secret: ${JWT_SECRET.substring(0, 8)}...`);
+    console.log('========================================');
+    console.log('Endpoints Publicos:');
+    console.log('  GET  /api/status          - Status');
+    console.log('  POST /api/auth/login       - Login (JWT)');
+    console.log('  POST /api/auth/validate    - Validar token');
+    console.log('Endpoints Protegidos (Bearer Token):');
+    console.log('  GET  /api/load             - Carregar dados');
+    console.log('  POST /api/save             - Salvar dados');
+    console.log('  POST /api/auth/change-password - Alterar senha');
+    console.log('Admin Only:');
+    console.log('  POST /api/auth/create-user - Criar usuario');
+    console.log('  GET  /api/users            - Listar usuarios');
+    console.log('  PUT  /api/users/:id        - Editar usuario');
+    console.log('  DELETE /api/users/:id      - Desativar usuario');
+    console.log('========================================');
+  });
+}).catch(e => {
+  console.error('[FATAL] Erro ao inicializar:', e);
+  process.exit(1);
 });
