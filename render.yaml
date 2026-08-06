@@ -10,7 +10,7 @@ services:
       - key: NODE_ENV
         value: production
       - key: JWT_SECRET
-        generateValue: true
+        value: petshop-prado-minha-senha-secreta-2024
     disks:
       - name: petshop-data
         mountPath: /opt/render/project/src/data
