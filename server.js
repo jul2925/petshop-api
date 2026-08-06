@@ -7,11 +7,31 @@ const jwt = require('jsonwebtoken');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'petshop-prado-secret-key-2024';
+const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRES = '7d';
 const BCRYPT_ROUNDS = 10;
 
-app.use(cors());
+if (!JWT_SECRET) {
+  console.error('[FATAL] JWT_SECRET nao definido nas variaveis de ambiente');
+  process.exit(1);
+}
+
+const ALLOWED_ORIGINS = [
+  'https://jul2925.github.io',
+  'http://localhost:3000',
+  'http://localhost:5173'
+];
+
+app.use(cors({
+  origin: function (origin, callback) {
+    if (!origin || ALLOWED_ORIGINS.some(o => origin.startsWith(o))) {
+      callback(null, true);
+    } else {
+      callback(new Error('Nao permitido por CORS'));
+    }
+  },
+  credentials: true
+}));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
@@ -209,7 +229,7 @@ app.get('/api/status', (req, res) => {
   const data = loadFromFile();
   res.json({
     status: 'online',
-    version: '2.0.0',
+    version: '2.1.0',
     products: data ? data.products.length : 0,
     users: data ? data.users.length : 0,
     clients: data ? data.clients.length : 0,
@@ -357,7 +377,6 @@ app.get('/api/load', authMiddleware, (req, res) => {
       saveToFile(data);
     }
 
-    const sensitiveFields = ['password'];
     if (req.user.type !== 'admin') {
       delete data.activityLog;
     }
@@ -462,54 +481,66 @@ app.delete('/api/reset', authMiddleware, adminOnly, (req, res) => {
   }
 });
 
-// ===== STATIC FILES =====
-app.use(express.static(path.join(__dirname)));
+// ===== API INFO (sem static files) =====
 
-app.get('*', (req, res) => {
-  const indexPath = path.join(__dirname, 'index.html');
-  if (fs.existsSync(indexPath)) {
-    res.sendFile(indexPath);
-  } else {
-    res.status(200).json({
-      status: 'online',
-      message: 'PetShop Prado API v2.0 - Autenticacao JWT ativa',
-      endpoints: {
+app.get('/', (req, res) => {
+  res.json({
+    name: 'PetShop Prado API',
+    version: '2.1.0',
+    status: 'online',
+    endpoints: {
+      public: {
+        status: 'GET /api/status',
         login: 'POST /api/auth/login',
-        validate: 'POST /api/auth/validate',
-        load: 'GET /api/load (requer token)',
-        save: 'POST /api/save (requer token)',
-        status: 'GET /api/status'
+        validate: 'POST /api/auth/validate'
+      },
+      protected: {
+        load: 'GET /api/load',
+        save: 'POST /api/save',
+        changePassword: 'POST /api/auth/change-password'
+      },
+      admin: {
+        createUser: 'POST /api/auth/create-user',
+        listUsers: 'GET /api/users',
+        editUser: 'PUT /api/users/:id',
+        disableUser: 'DELETE /api/users/:id',
+        reset: 'DELETE /api/reset'
       }
-    });
-  }
+    }
+  });
 });
 
 // ===== START =====
-initDefaultUsers().then(() => {
-  app.listen(PORT, '0.0.0.0', () => {
+
+const server = initDefaultUsers().then(() => {
+  const instance = app.listen(PORT, '0.0.0.0', () => {
     console.log('========================================');
-    console.log('   PetShop Prado - API v2.0 JWT');
+    console.log('   PetShop Prado - API v2.1.0');
     console.log('========================================');
     console.log(`Porta: ${PORT}`);
-    console.log(`Arquivo DB: ${DB_FILE}`);
+    console.log(`DB: ${DB_FILE}`);
     console.log(`Ambiente: ${process.env.NODE_ENV || 'desenvolvimento'}`);
-    console.log(`JWT Secret: ${JWT_SECRET.substring(0, 8)}...`);
-    console.log('========================================');
-    console.log('Endpoints Publicos:');
-    console.log('  GET  /api/status          - Status');
-    console.log('  POST /api/auth/login       - Login (JWT)');
-    console.log('  POST /api/auth/validate    - Validar token');
-    console.log('Endpoints Protegidos (Bearer Token):');
-    console.log('  GET  /api/load             - Carregar dados');
-    console.log('  POST /api/save             - Salvar dados');
-    console.log('  POST /api/auth/change-password - Alterar senha');
-    console.log('Admin Only:');
-    console.log('  POST /api/auth/create-user - Criar usuario');
-    console.log('  GET  /api/users            - Listar usuarios');
-    console.log('  PUT  /api/users/:id        - Editar usuario');
-    console.log('  DELETE /api/users/:id      - Desativar usuario');
     console.log('========================================');
   });
+
+  // Graceful Shutdown
+  const shutdown = async (signal) => {
+    console.log(`\n[${signal}] Encerrando servidor...`);
+    instance.close(() => {
+      console.log('[OK] Servidor encerrado graciosamente');
+      process.exit(0);
+    });
+
+    setTimeout(() => {
+      console.error('[FATAL] Forcando encerramento');
+      process.exit(1);
+    }, 10000);
+  };
+
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
+
+  return instance;
 }).catch(e => {
   console.error('[FATAL] Erro ao inicializar:', e);
   process.exit(1);

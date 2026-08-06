@@ -9,8 +9,8 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
-      - key: PORT
-        value: 3000
+      - key: JWT_SECRET
+        generateValue: true
     disks:
       - name: petshop-data
         mountPath: /opt/render/project/src/data
