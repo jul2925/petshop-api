@@ -1,547 +1,792 @@
-const express = require('express');
-const cors = require('cors');
+require('dotenv').config();
+
+const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
-const bcrypt = require('bcryptjs');
-const jwt = require('jsonwebtoken');
+const mongo = require('./mongo');
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = process.env.JWT_SECRET;
-const JWT_EXPIRES = '7d';
-const BCRYPT_ROUNDS = 10;
+const PORT = process.env.PORT || 8000;
+const HTTPS_PORT = process.env.HTTPS_PORT || 8443;
+const CERT_FILE = path.join(__dirname, 'cert.pem');
+const KEY_FILE = path.join(__dirname, 'key.pem');
+const STATIC_DIR = __dirname;
 
-if (!JWT_SECRET) {
-  console.error('[FATAL] JWT_SECRET nao definido nas variaveis de ambiente');
-  process.exit(1);
+let sseClients = [];
+let lastDataVersion = 0;
+
+// ===== UTILS =====
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      try {
+        resolve(JSON.parse(body));
+      } catch (e) {
+        reject(new Error('JSON invalido'));
+      }
+    });
+    req.on('error', reject);
+  });
 }
 
-const ALLOWED_ORIGINS = [
-  'https://jul2925.github.io',
-  'http://localhost:3000',
-  'http://localhost:5173'
-];
+function json(res, status, data) {
+  res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(data));
+}
 
-app.use(cors({
-  origin: function (origin, callback) {
-    if (!origin || ALLOWED_ORIGINS.some(o => origin.startsWith(o))) {
-      callback(null, true);
-    } else {
-      callback(new Error('Nao permitido por CORS'));
+function serveFile(res, filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  const types = {
+    '.html': 'text/html; charset=utf-8',
+    '.css': 'text/css; charset=utf-8',
+    '.js': 'application/javascript; charset=utf-8',
+    '.json': 'application/json; charset=utf-8',
+    '.ico': 'image/x-icon',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.gif': 'image/gif',
+    '.svg': 'image/svg+xml',
+    '.woff': 'font/woff',
+    '.woff2': 'font/woff2'
+  };
+
+  fs.readFile(filePath, (err, content) => {
+    if (err) {
+      res.writeHead(404);
+      res.end('Arquivo nao encontrado');
+      return;
     }
-  },
-  credentials: true
-}));
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-const DB_FILE = path.join(__dirname, 'data', 'petshop.json');
-const DATA_DIR = path.join(__dirname, 'data');
-
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
+    res.writeHead(200, {
+      'Content-Type': types[ext] || 'text/plain; charset=utf-8',
+      'Cache-Control': 'no-cache, no-store, must-revalidate',
+      'Pragma': 'no-cache',
+      'Expires': '0'
+    });
+    res.end(content);
+  });
 }
 
-const DEFAULT_DB = {
-  products: [
-    {id:1,name:'Racao Premium Cao Adulto 15kg',cat:'Alimentacao',price:189.90,stock:40,minStock:8,unit:'kg',barcode:'7891000001001',emoji:'🐕'},
-    {id:2,name:'Racao Premium Gato Adulto 10kg',cat:'Alimentacao',price:159.90,stock:35,minStock:8,unit:'kg',barcode:'7891000001002',emoji:'🐱'},
-    {id:3,name:'Racao Filhote Cao 8kg',cat:'Alimentacao',price:129.90,stock:30,minStock:6,unit:'kg',barcode:'7891000001003',emoji:'🐶'},
-    {id:4,name:'Racao Filhote Gato 5kg',cat:'Alimentacao',price:99.90,stock:25,minStock:6,unit:'kg',barcode:'7891000001004',emoji:'🐈'},
-    {id:5,name:'Racao Senior Cao 12kg',cat:'Alimentacao',price:169.90,stock:20,minStock:5,unit:'kg',barcode:'7891000001006',emoji:'🐕'},
-    {id:6,name:'Petisco Dental Cao 150g',cat:'Alimentacao',price:24.90,stock:60,minStock:10,unit:'g',barcode:'7891000001007',emoji:'🦴'},
-    {id:7,name:'Petisco Gato Tubo 20g x6',cat:'Alimentacao',price:18.90,stock:80,minStock:12,unit:'un',barcode:'7891000001008',emoji:'🐟'},
-    {id:8,name:'Ossinho Defumado 120g',cat:'Alimentacao',price:19.90,stock:50,minStock:10,unit:'g',barcode:'7891000001009',emoji:'🦴'},
-    {id:9,name:'Sache Frango Gato 85g',cat:'Alimentacao',price:5.90,stock:200,minStock:30,unit:'g',barcode:'7891000001010',emoji:'🍗'},
-    {id:10,name:'Sache Carne Gato 85g',cat:'Alimentacao',price:5.90,stock:180,minStock:30,unit:'g',barcode:'7891000001011',emoji:'🥩'},
-    {id:11,name:'Shampoo Neutro Cao 500ml',cat:'Higiene',price:32.90,stock:40,minStock:8,unit:'ml',barcode:'7891000001012',emoji:'🧴'},
-    {id:12,name:'Shampoo Antipulga 500ml',cat:'Higiene',price:39.90,stock:35,minStock:8,unit:'ml',barcode:'7891000001013',emoji:'🧴'},
-    {id:13,name:'Areia Sanitaria Silica 5kg',cat:'Higiene',price:29.90,stock:80,minStock:15,unit:'kg',barcode:'7891000001015',emoji:'🧱'},
-    {id:14,name:'Areia Sanitaria Bentonita 10kg',cat:'Higiene',price:24.90,stock:60,minStock:12,unit:'kg',barcode:'7891000001016',emoji:'🧱'},
-    {id:15,name:'Perfume Pet Spray 120ml',cat:'Higiene',price:28.90,stock:45,minStock:8,unit:'ml',barcode:'7891000001018',emoji:'🌸'},
-    {id:16,name:'Coleira Couro Pequena',cat:'Acessorios',price:49.90,stock:25,minStock:5,unit:'un',barcode:'7891000001021',emoji:'📿'},
-    {id:17,name:'Coleira Couro Media',cat:'Acessorios',price:59.90,stock:25,minStock:5,unit:'un',barcode:'7891000001022',emoji:'📿'},
-    {id:18,name:'Coleira Couro Grande',cat:'Acessorios',price:69.90,stock:20,minStock:5,unit:'un',barcode:'7891000001023',emoji:'📿'},
-    {id:19,name:'Guia de Passeio Retractil',cat:'Acessorios',price:44.90,stock:30,minStock:6,unit:'un',barcode:'7891000001024',emoji:'🔗'},
-    {id:20,name:'Bolinha de Silicone',cat:'Brinquedos',price:14.90,stock:100,minStock:15,unit:'un',emoji:'⚽'},
-    {id:21,name:'Ratinho de Pelucia x3',cat:'Brinquedos',price:22.90,stock:60,minStock:10,unit:'un',emoji:'🐭'},
-    {id:22,name:'Corda Trancada Cao',cat:'Brinquedos',price:29.90,stock:45,minStock:8,unit:'un',emoji:'🪢'},
-    {id:23,name:'Casinha Cao Medio',cat:'Casas e Camas',price:189.90,stock:15,minStock:3,unit:'un',emoji:'🏠'},
-    {id:24,name:'Cama Peluda Oval P',cat:'Casas e Camas',price:89.90,stock:20,minStock:5,unit:'un',emoji:'🛏️'},
-    {id:25,name:'Cama Peluda Oval M',cat:'Casas e Camas',price:119.90,stock:15,minStock:4,unit:'un',emoji:'🛏️'},
-    {id:26,name:'Caixa de Transporte P',cat:'Transporte',price:79.90,stock:20,minStock:5,unit:'un',emoji:'📦'},
-    {id:27,name:'Caixa de Transporte M',cat:'Transporte',price:99.90,stock:15,minStock:4,unit:'un',emoji:'📦'},
-    {id:28,name:'Comedouro Inox P',cat:'Acessorios',price:29.90,stock:40,minStock:8,unit:'un',emoji:'🥣'},
-    {id:29,name:'Comedouro Inox M',cat:'Acessorios',price:34.90,stock:35,minStock:8,unit:'un',emoji:'🥣'},
-    {id:30,name:'Bebedouro Automatico 2L',cat:'Acessorios',price:79.90,stock:20,minStock:5,unit:'un',emoji:'💧'},
-    {id:31,name:'Antipulga Cao P 4un',cat:'Saude',price:59.90,stock:40,minStock:8,unit:'un',emoji:'💊'},
-    {id:32,name:'Antipulga Cao G 4un',cat:'Saude',price:79.90,stock:30,minStock:6,unit:'un',emoji:'💊'},
-    {id:33,name:'Antipulga Gato 3un',cat:'Saude',price:54.90,stock:35,minStock:8,unit:'un',emoji:'💊'},
-    {id:34,name:'Vermifugo Cao 2un',cat:'Saude',price:39.90,stock:50,minStock:10,unit:'un',emoji:'💊'},
-    {id:35,name:'Vermifugo Gato 2un',cat:'Saude',price:34.90,stock:45,minStock:10,unit:'un',emoji:'💊'},
-    {id:36,name:'Vacina V10 Cao',cat:'Saude',price:89.90,stock:20,minStock:5,unit:'un',emoji:'💉'},
-    {id:37,name:'Vacina V4 Gato',cat:'Saude',price:79.90,stock:20,minStock:5,unit:'un',emoji:'💉'},
-    {id:38,name:'Vitamina Pet 250ml',cat:'Saude',price:44.90,stock:30,minStock:6,unit:'ml',emoji:'🧪'},
-    {id:39,name:'Roupa Pet Estampada P',cat:'Roupas',price:39.90,stock:20,minStock:5,unit:'un',emoji:'👗'},
-    {id:40,name:'Roupa Pet Estampada M',cat:'Roupas',price:49.90,stock:20,minStock:5,unit:'un',emoji:'👗'}
-  ],
-  employees: [
-    {id:1,name:'Carlos Silva',role:'Caixa',shift:'Manha',salary:2200,active:true,phone:'(11)99999-1111'},
-    {id:2,name:'Maria Santos',role:'Estoque',shift:'Tarde',salary:2400,active:true,phone:'(11)99999-2222'},
-    {id:3,name:'Joao Oliveira',role:'Gerente',shift:'Manha',salary:4500,active:true,phone:'(11)99999-3333'}
-  ],
-  users: [],
-  clients: [
-    {id:1,name:'Joao Pereira',phone:'(11)98888-1001',cpf:'123.456.789-00',email:'joao@email.com',address:'Rua das Flores, 100 - SP',active:true,dogs:[]},
-    {id:2,name:'Ana Beatriz',phone:'(11)98888-1002',cpf:'987.654.321-00',email:'ana@email.com',address:'Av. Brasil, 200 - SP',active:true,dogs:[{name:'Rex',breed:'Labrador',age:3,color:'Dourado'}]},
-    {id:3,name:'Carlos Mendes',phone:'(11)98888-1003',cpf:'456.789.123-00',email:'carlos@email.com',address:'Rua Augusta, 300 - SP',active:true,dogs:[{name:'Thor',breed:'Bulldog',age:4,color:'Marrom'}]}
-  ],
-  bathGrooming: [
-    {id:1,clientId:2,dogName:'Rex',service:'Banho e Tosa Completa',date:new Date(Date.now()-86400000*2).toISOString(),price:120,status:'Concluido',notes:'Cachorro calmo',professional:'Maria Santos'},
-    {id:2,clientId:2,dogName:'Luna',service:'Banho Simples',date:new Date(Date.now()-86400000).toISOString(),price:60,status:'Concluido',notes:'Usar shampoo hipoalergenico',professional:'Ana Costa'}
-  ],
-  sales: [],
-  expenses: [],
-  activityLog: [],
-  nextProductId: 41,
-  nextEmployeeId: 4,
-  nextUserId: 4,
-  nextSaleId: 1,
-  nextClientId: 4,
-  nextBathId: 3,
-  nextExpenseId: 1,
-  settings: {
-    pixKey: '',
-    pixName: 'PetShop Prado',
-    pixCity: 'Sao Paulo',
-    scale: { mode:'serial', protocol:'toledo', baudRate:9600, dataBits:8, stopBits:1, parity:'none', unitDefault:'kg', stableTimeout:2000, decimals:3 },
-    company: { name:'', fantasyName:'', cnpj:'', cpf:'', ie:'', im:'', address:'', number:'', complement:'', neighborhood:'', city:'', state:'', zip:'', phone:'', phone2:'', email:'', website:'', activity:'', logo:'', motto:'' }
-  }
-};
+// ===== SSE =====
+function broadcastSSE(event, data) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  sseClients = sseClients.filter(client => {
+    try {
+      client.res.write(msg);
+      return true;
+    } catch (e) {
+      return false;
+    }
+  });
+}
 
-const DEFAULT_USERS = [
-  {id:1,username:'admin',password:'admin123',name:'Administrador Geral',type:'admin',active:true},
-  {id:2,username:'func',password:'func123',name:'Funcionario Teste',type:'func',active:true},
-  {id:3,username:'cliente',password:'cli123',name:'Cliente Teste',type:'cliente',active:true}
-];
+// ===== MONGO DATA LAYER =====
+const COLLECTION = 'appdata';
+const DATA_KEY = { _id: 'main' };
 
-function loadFromFile() {
+async function loadData() {
   try {
-    if (fs.existsSync(DB_FILE)) {
-      const raw = fs.readFileSync(DB_FILE, 'utf8');
-      const data = JSON.parse(raw);
-      if (data && data.products) return data;
+    const doc = await mongo.findOne(COLLECTION, DATA_KEY);
+    if (doc) {
+      const { _id, ...rest } = doc;
+      return rest;
     }
   } catch (e) {
-    console.error('[ERRO] Ao ler arquivo:', e.message);
+    console.error('[DB] Erro ao ler dados:', e.message);
   }
   return null;
 }
 
-function saveToFile(data) {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      fs.copyFileSync(DB_FILE, path.join(DATA_DIR, 'petshop.backup.json'));
-    }
-    fs.writeFileSync(DB_FILE, JSON.stringify(data, null, 2), 'utf8');
+async function saveData(data) {
+  lastDataVersion++;
+  const { _id, ...toSave } = data;
+  await mongo.replaceOne(COLLECTION, DATA_KEY, toSave);
+}
+
+// ===== GENERIC CRUD HELPER =====
+async function getArrayField(field) {
+  const data = await loadData();
+  return data ? (data[field] || []) : [];
+}
+
+async function setArrayField(field, items) {
+  const data = await loadData();
+  if (!data) throw new Error('Dados nao encontrados');
+  data[field] = items;
+  await saveData(data);
+  broadcastSSE('update', { version: lastDataVersion, timestamp: Date.now(), field });
+  return items;
+}
+
+function getNextId(items) {
+  if (!items || items.length === 0) return 1;
+  return Math.max(...items.map(i => i.id || 0)) + 1;
+}
+
+// ===== ROUTES =====
+function parseUrl(req) {
+  const [pathPart, queryString] = (req.url || '/').split('?');
+  const params = {};
+  if (queryString) {
+    queryString.split('&').forEach(p => {
+      const [k, v] = p.split('=');
+      params[decodeURIComponent(k)] = decodeURIComponent(v || '');
+    });
+  }
+  return { path: pathPart, params, method: req.method };
+}
+
+async function handleApi(req, res) {
+  const { path, params, method } = parseUrl(req);
+
+  // CORS
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, PATCH, DELETE, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+
+  if (method === 'OPTIONS') {
+    res.writeHead(200);
+    res.end();
     return true;
-  } catch (e) {
-    console.error('[ERRO] Ao salvar arquivo:', e.message);
-    return false;
-  }
-}
-
-async function initDefaultUsers() {
-  let data = loadFromFile();
-  if (!data) {
-    data = Object.assign({}, DEFAULT_DB);
-    data.users = [];
-    saveToFile(data);
   }
 
-  if (!data.users) data.users = [];
-  if (!data.nextUserId) data.nextUserId = 1;
+  // ===== SYSTEM =====
 
-  for (const defUser of DEFAULT_USERS) {
-    const exists = data.users.find(u => u.username === defUser.username);
-    if (!exists) {
-      const hashedPassword = await bcrypt.hash(defUser.password, BCRYPT_ROUNDS);
-      data.users.push({
-        id: data.nextUserId++,
-        username: defUser.username,
-        password: hashedPassword,
-        name: defUser.name,
-        type: defUser.type,
-        active: defUser.active
-      });
-      console.log(`[INIT] Usuario "${defUser.username}" criado com senha hasheada`);
-    } else {
-      const isHashed = exists.password && exists.password.startsWith('$2');
-      if (!isHashed) {
-        exists.password = await bcrypt.hash(exists.password, BCRYPT_ROUNDS);
-        console.log(`[INIT] Senha de "${defUser.username}" hasheada pela primeira vez`);
-      }
-    }
+  // Health check
+  if (path === '/api/health' && method === 'GET') {
+    json(res, 200, { ok: true, uptime: process.uptime() });
+    return true;
   }
-  saveToFile(data);
-  console.log(`[INIT] ${data.users.length} usuarios verificados no banco`);
-}
 
-function generateToken(user) {
-  return jwt.sign(
-    { id: user.id, username: user.username, type: user.type, name: user.name },
-    JWT_SECRET,
-    { expiresIn: JWT_EXPIRES }
-  );
-}
-
-function authMiddleware(req, res, next) {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    return res.status(401).json({ error: 'Token de autenticacao necessario' });
-  }
-  const token = authHeader.split(' ')[1];
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    req.user = decoded;
-    next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Token invalido ou expirado' });
-  }
-}
-
-function adminOnly(req, res, next) {
-  if (req.user.type !== 'admin') {
-    return res.status(403).json({ error: 'Acesso restrito a administradores' });
-  }
-  next();
-}
-
-function removePassword(user) {
-  const u = Object.assign({}, user);
-  delete u.password;
-  return u;
-}
-
-// ===== PUBLIC ROUTES =====
-
-app.get('/api/status', (req, res) => {
-  const data = loadFromFile();
-  res.json({
-    status: 'online',
-    version: '2.1.0',
-    products: data ? data.products.length : 0,
-    users: data ? data.users.length : 0,
-    clients: data ? data.clients.length : 0,
-    sales: data ? data.sales.length : 0,
-    uptime: process.uptime(),
-    memory: process.memoryUsage(),
-    timestamp: new Date().toISOString()
-  });
-});
-
-app.post('/api/auth/login', async (req, res) => {
-  try {
-    const { username, password } = req.body;
-    if (!username || !password) {
-      return res.status(400).json({ error: 'Usuario e senha sao obrigatorios' });
-    }
-
-    let data = loadFromFile();
-    if (!data) {
-      data = Object.assign({}, DEFAULT_DB);
-      data.users = [];
-      saveToFile(data);
-    }
-
-    const user = (data.users || []).find(u => u.username === username && u.active);
-    if (!user) {
-      return res.status(401).json({ error: 'Usuario ou senha invalidos' });
-    }
-
-    const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Usuario ou senha invalidos' });
-    }
-
-    const token = generateToken(user);
-
-    console.log(`[LOGIN] ${user.username} (${user.type}) logado com sucesso`);
-
-    res.json({
-      token,
-      user: removePassword(user)
+  // Status
+  if (path === '/api/status' && method === 'GET') {
+    json(res, 200, {
+      version: lastDataVersion,
+      clients: sseClients.length,
+      uptime: process.uptime(),
+      db: 'mongodb',
+      dbName: process.env.MONGO_DB_NAME || 'petshop_prado',
+      mode: process.env.MONGO_MODE || 'local'
     });
-  } catch (e) {
-    console.error('[ERRO] /api/auth/login:', e.message);
-    res.status(500).json({ error: 'Erro ao fazer login' });
+    return true;
+  }
+
+  // ===== SSE =====
+  if (path === '/api/events' && method === 'GET') {
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+
+    res.write(`event: connected\ndata: {"version":${lastDataVersion}}\n\n`);
+
+    const clientId = Date.now();
+    sseClients.push({ id: clientId, res });
+    console.log(`[SSE] Cliente conectado (${sseClients.length} total)`);
+
+    req.on('close', () => {
+      sseClients = sseClients.filter(c => c.id !== clientId);
+      console.log(`[SSE] Cliente desconectado (${sseClients.length} total)`);
+    });
+
+    const heartbeat = setInterval(() => {
+      try { res.write(': heartbeat\n\n'); } catch (e) { clearInterval(heartbeat); }
+    }, 30000);
+    req.on('close', () => clearInterval(heartbeat));
+    return true;
+  }
+
+  // ===== FULL DATA (compatibilidade com client antigo) =====
+
+  // Load - carregar todos os dados
+  if (path === '/api/load' && method === 'GET') {
+    const data = await loadData();
+    json(res, 200, data);
+    return true;
+  }
+
+  // Save - salvar todos os dados
+  if (path === '/api/save' && method === 'POST') {
+    try {
+      const parsed = await parseBody(req);
+      await saveData(parsed);
+      broadcastSSE('update', { version: lastDataVersion, timestamp: Date.now() });
+      json(res, 200, { ok: true, version: lastDataVersion });
+      console.log(`[SAVE] Dados salvos (v${lastDataVersion}) e notificados ${sseClients.length} clientes`);
+    } catch (e) {
+      json(res, 400, { error: e.message });
+    }
+    return true;
+  }
+
+  // ===== PRODUCTS CRUD =====
+  if (path === '/api/products' && method === 'GET') {
+    const items = await getArrayField('products');
+    json(res, 200, items);
+    return true;
+  }
+
+  if (path === '/api/products' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('products');
+      const nextId = getNextId(items);
+      const item = { id: nextId, ...body };
+      items.push(item);
+      await setArrayField('products', items);
+      json(res, 201, item);
+    } catch (e) {
+      json(res, 400, { error: e.message });
+    }
+    return true;
+  }
+
+  if (path.match(/^\/api\/products\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('products');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Produto nao encontrado' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('products', items);
+      json(res, 200, items[idx]);
+    } catch (e) {
+      json(res, 400, { error: e.message });
+    }
+    return true;
+  }
+
+  if (path.match(/^\/api\/products\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('products');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Produto nao encontrado' }); return true; }
+      await setArrayField('products', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) {
+      json(res, 400, { error: e.message });
+    }
+    return true;
+  }
+
+  // ===== EMPLOYEES CRUD =====
+  if (path === '/api/employees' && method === 'GET') {
+    json(res, 200, await getArrayField('employees'));
+    return true;
+  }
+
+  if (path === '/api/employees' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('employees');
+      const item = { id: getNextId(items), ...body };
+      items.push(item);
+      await setArrayField('employees', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/employees\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('employees');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Funcionario nao encontrado' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('employees', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/employees\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('employees');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Funcionario nao encontrado' }); return true; }
+      await setArrayField('employees', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== USERS CRUD =====
+  if (path === '/api/users' && method === 'GET') {
+    json(res, 200, await getArrayField('users'));
+    return true;
+  }
+
+  if (path === '/api/users' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('users');
+      const item = { id: getNextId(items), ...body };
+      items.push(item);
+      await setArrayField('users', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/users\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('users');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Usuario nao encontrado' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('users', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/users\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('users');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Usuario nao encontrado' }); return true; }
+      await setArrayField('users', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== CLIENTS CRUD =====
+  if (path === '/api/clients' && method === 'GET') {
+    json(res, 200, await getArrayField('clients'));
+    return true;
+  }
+
+  if (path === '/api/clients' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('clients');
+      const item = { id: getNextId(items), active: true, dogs: [], ...body };
+      items.push(item);
+      await setArrayField('clients', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/clients\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('clients');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Cliente nao encontrado' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('clients', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/clients\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('clients');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Cliente nao encontrado' }); return true; }
+      await setArrayField('clients', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== BATH & GROOMING CRUD =====
+  if (path === '/api/bathgrooming' && method === 'GET') {
+    json(res, 200, await getArrayField('bathGrooming'));
+    return true;
+  }
+
+  if (path === '/api/bathgrooming' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('bathGrooming');
+      const item = { id: getNextId(items), date: new Date().toISOString(), status: 'Agendado', ...body };
+      items.push(item);
+      await setArrayField('bathGrooming', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/bathgrooming\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('bathGrooming');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Agendamento nao encontrado' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('bathGrooming', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/bathgrooming\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('bathGrooming');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Agendamento nao encontrado' }); return true; }
+      await setArrayField('bathGrooming', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== SERVICES CRUD =====
+  if (path === '/api/services' && method === 'GET') {
+    json(res, 200, await getArrayField('services'));
+    return true;
+  }
+
+  if (path === '/api/services' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('services');
+      const item = { id: getNextId(items), active: true, ...body };
+      items.push(item);
+      await setArrayField('services', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/services\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('services');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Servico nao encontrado' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('services', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/services\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('services');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Servico nao encontrado' }); return true; }
+      await setArrayField('services', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== SALES CRUD =====
+  if (path === '/api/sales' && method === 'GET') {
+    json(res, 200, await getArrayField('sales'));
+    return true;
+  }
+
+  if (path === '/api/sales' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('sales');
+      const item = { id: getNextId(items), date: new Date().toISOString(), status: 'concluido', ...body };
+      items.push(item);
+      await setArrayField('sales', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/sales\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('sales');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Venda nao encontrada' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('sales', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/sales\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('sales');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Venda nao encontrada' }); return true; }
+      await setArrayField('sales', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== EXPENSES CRUD =====
+  if (path === '/api/expenses' && method === 'GET') {
+    json(res, 200, await getArrayField('expenses'));
+    return true;
+  }
+
+  if (path === '/api/expenses' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('expenses');
+      const item = { id: getNextId(items), date: new Date().toISOString(), ...body };
+      items.push(item);
+      await setArrayField('expenses', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/expenses\/\d+$/) && method === 'PUT') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const body = await parseBody(req);
+      const items = await getArrayField('expenses');
+      const idx = items.findIndex(i => i.id === id);
+      if (idx === -1) { json(res, 404, { error: 'Despesa nao encontrada' }); return true; }
+      items[idx] = { ...items[idx], ...body, id };
+      await setArrayField('expenses', items);
+      json(res, 200, items[idx]);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  if (path.match(/^\/api\/expenses\/\d+$/) && method === 'DELETE') {
+    try {
+      const id = parseInt(path.split('/').pop());
+      const items = await getArrayField('expenses');
+      const filtered = items.filter(i => i.id !== id);
+      if (filtered.length === items.length) { json(res, 404, { error: 'Despesa nao encontrada' }); return true; }
+      await setArrayField('expenses', filtered);
+      json(res, 200, { ok: true });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== ACTIVITY LOG =====
+  if (path === '/api/activitylog' && method === 'GET') {
+    json(res, 200, await getArrayField('activityLog'));
+    return true;
+  }
+
+  if (path === '/api/activitylog' && method === 'POST') {
+    try {
+      const body = await parseBody(req);
+      const items = await getArrayField('activityLog');
+      const item = { date: new Date().toISOString(), ...body };
+      items.unshift(item);
+      if (items.length > 500) items.length = 500;
+      await setArrayField('activityLog', items);
+      json(res, 201, item);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== SETTINGS =====
+  if (path === '/api/settings' && method === 'GET') {
+    const data = await loadData();
+    json(res, 200, data ? data.settings || {} : {});
+    return true;
+  }
+
+  if (path === '/api/settings' && method === 'PUT') {
+    try {
+      const body = await parseBody(req);
+      const data = await loadData();
+      if (!data) { json(res, 404, { error: 'Dados nao encontrados' }); return true; }
+      data.settings = { ...data.settings, ...body };
+      await saveData(data);
+      broadcastSSE('update', { version: lastDataVersion, timestamp: Date.now(), field: 'settings' });
+      json(res, 200, data.settings);
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== LOGIN =====
+  if (path === '/api/login' && method === 'POST') {
+    try {
+      const { username, password } = await parseBody(req);
+      const users = await getArrayField('users');
+      const user = users.find(u => u.username === username && u.password === password && u.active);
+      if (user) {
+        const { password: _, ...safeUser } = user;
+        json(res, 200, { ok: true, user: safeUser });
+      } else {
+        json(res, 401, { error: 'Usuario ou senha invalidos' });
+      }
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== SEED (recriar dados) =====
+  if (path === '/api/seed' && method === 'POST') {
+    try {
+      const DEFAULT_DB = require('./seed-data');
+      await saveData(DEFAULT_DB);
+      json(res, 200, { ok: true, message: 'Dados iniciais restaurados' });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  // ===== BACKUP (exportar dados) =====
+  if (path === '/api/backup' && method === 'GET') {
+    const data = await loadData();
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Content-Disposition': 'attachment; filename="petshop-prado-backup.json"'
+    });
+    res.end(JSON.stringify(data, null, 2));
+    return true;
+  }
+
+  // ===== RESTORE (importar dados) =====
+  if (path === '/api/restore' && method === 'POST') {
+    try {
+      const parsed = await parseBody(req);
+      if (!parsed || !parsed.products) {
+        json(res, 400, { error: 'Dados de backup invalidos' });
+        return true;
+      }
+      await saveData(parsed);
+      broadcastSSE('update', { version: lastDataVersion, timestamp: Date.now() });
+      json(res, 200, { ok: true, message: 'Dados restaurados com sucesso' });
+    } catch (e) { json(res, 400, { error: e.message }); }
+    return true;
+  }
+
+  return false;
+}
+
+// ===== HTTP SERVER =====
+const server = http.createServer(async (req, res) => {
+  try {
+    // Tenta API primeiro
+    if (req.url.startsWith('/api/')) {
+      const handled = await handleApi(req, res);
+      if (handled) return;
+    }
+
+    // Arquivos estaticos
+    let filePath = (req.url || '/').split('?')[0];
+    filePath = filePath === '/' ? '/index.html' : filePath;
+    filePath = path.join(STATIC_DIR, filePath);
+    serveFile(res, filePath);
+  } catch (err) {
+    console.error('[SERVER] Erro:', err.message);
+    json(res, 500, { error: 'Erro interno do servidor' });
   }
 });
 
-app.post('/api/auth/validate', (req, res) => {
-  const { token } = req.body;
-  if (!token) {
-    return res.status(400).json({ valid: false });
-  }
+// ===== INICIALIZACAO =====
+async function start() {
   try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    let data = loadFromFile();
-    if (!data) return res.json({ valid: false });
-    const user = (data.users || []).find(u => u.id === decoded.id && u.active);
-    if (!user) return res.json({ valid: false });
-    res.json({ valid: true, user: removePassword(user) });
-  } catch (e) {
-    res.json({ valid: false });
+    await mongo.connect();
+    await mongo.createIndex('appdata', '_id');
+
+    const data = await loadData();
+    if (data && data.nextProductId) {
+      lastDataVersion = 1;
+    }
+
+    server.listen(PORT, '0.0.0.0', () => {
+      console.log('=========================================');
+      console.log('  PetShop Prado - Backend Ativo');
+      console.log('=========================================');
+      console.log(`  HTTP:     http://localhost:${PORT}`);
+      console.log(`  Status:   http://localhost:${PORT}/api/status`);
+      console.log(`  Health:   http://localhost:${PORT}/api/health`);
+      console.log(`  API:      http://localhost:${PORT}/api/load`);
+      console.log(`  SSE:      http://localhost:${PORT}/api/events`);
+      console.log(`  MongoDB:  ${process.env.MONGO_MODE || 'local'}`);
+      console.log('=========================================');
+
+      // HTTPS (apenas local, se certificados existirem)
+      if (fs.existsSync(CERT_FILE) && fs.existsSync(KEY_FILE)) {
+        const httpsOptions = {
+          cert: fs.readFileSync(CERT_FILE),
+          key: fs.readFileSync(KEY_FILE)
+        };
+        const httpsServer = https.createServer(httpsOptions, server.listeners('request')[0]);
+        httpsServer.listen(HTTPS_PORT, '0.0.0.0', () => {
+          console.log(`[HTTPS] Servidor HTTPS ativo na porta ${HTTPS_PORT}`);
+        });
+      }
+    });
+  } catch (err) {
+    console.error('[FATAL] Erro ao iniciar:', err.message);
+    process.exit(1);
   }
-});
+}
 
-app.post('/api/auth/change-password', authMiddleware, async (req, res) => {
+// ===== TRAY (apenas Windows/local) =====
+if (process.platform === 'win32' && !process.env.RENDER) {
   try {
-    const { currentPassword, newPassword } = req.body;
-    if (!currentPassword || !newPassword) {
-      return res.status(400).json({ error: 'Senha atual e nova senha sao obrigatorias' });
+    const SysTray = require('systray2').default;
+    function readIconBuffer() {
+      const iconPath = path.join(__dirname, 'icon.png');
+      try {
+        if (fs.existsSync(iconPath)) {
+          const buf = fs.readFileSync(iconPath);
+          if (buf.length > 0 && buf.length < 100000) return buf;
+        }
+      } catch (e) {}
+      return null;
     }
-    if (newPassword.length < 4) {
-      return res.status(400).json({ error: 'Nova senha deve ter pelo menos 4 caracteres' });
-    }
-
-    let data = loadFromFile();
-    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
-
-    const user = (data.users || []).find(u => u.id === req.user.id);
-    if (!user) return res.status(404).json({ error: 'Usuario nao encontrado' });
-
-    const valid = await bcrypt.compare(currentPassword, user.password);
-    if (!valid) return res.status(401).json({ error: 'Senha atual incorreta' });
-
-    user.password = await bcrypt.hash(newPassword, BCRYPT_ROUNDS);
-    saveToFile(data);
-
-    console.log(`[AUTH] ${user.username} alterou a senha`);
-    res.json({ ok: true, message: 'Senha alterada com sucesso' });
-  } catch (e) {
-    console.error('[ERRO] /api/auth/change-password:', e.message);
-    res.status(500).json({ error: 'Erro ao alterar senha' });
-  }
-});
-
-app.post('/api/auth/create-user', authMiddleware, adminOnly, async (req, res) => {
-  try {
-    const { username, password, name, type } = req.body;
-    if (!username || !password || !name || !type) {
-      return res.status(400).json({ error: 'Todos os campos sao obrigatorios' });
-    }
-    if (!['admin', 'func', 'cliente'].includes(type)) {
-      return res.status(400).json({ error: 'Tipo de usuario invalido' });
-    }
-    if (password.length < 4) {
-      return res.status(400).json({ error: 'Senha deve ter pelo menos 4 caracteres' });
-    }
-
-    let data = loadFromFile();
-    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
-    if (!data.users) data.users = [];
-    if (!data.nextUserId) data.nextUserId = 1;
-
-    const exists = data.users.find(u => u.username === username);
-    if (exists) return res.status(400).json({ error: 'Nome de usuario ja existe' });
-
-    const hashedPassword = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    const newUser = {
-      id: data.nextUserId++,
-      username,
-      password: hashedPassword,
-      name,
-      type,
-      active: true
+    const iconBase64 = readIconBuffer();
+    const menuConfig = {
+      title: 'PetShop Prado',
+      tooltip: 'PetShop Prado - Servidor',
+      items: [
+        { title: 'Abrir no Navegador', tooltip: '', checked: false, enabled: true },
+        { title: 'Status', tooltip: '', checked: false, enabled: true },
+        { type: 'separator' },
+        { title: 'Sair', tooltip: '', checked: false, enabled: true }
+      ]
     };
-    data.users.push(newUser);
-    saveToFile(data);
+    if (iconBase64) menuConfig.icon = iconBase64;
+    const systray = new SysTray({ menu: menuConfig });
+    systray.ready().then(() => {
+      console.log('[TRAY] Icone da bandeja criado!');
+      systray.onClick(action => {
+        if (action.item.title === 'Abrir no Navegador') {
+          require('child_process').exec(`start http://localhost:${PORT}`);
+        } else if (action.item.title === 'Sair') {
+          mongo.close().then(() => { systray.kill(true).then(() => process.exit(0)); });
+        }
+      });
+    }).catch(() => {});
+  } catch (e) {}
+}
 
-    console.log(`[ADMIN] Novo usuario "${username}" (${type}) criado por ${req.user.username}`);
-    res.json({ ok: true, user: removePassword(newUser) });
-  } catch (e) {
-    console.error('[ERRO] /api/auth/create-user:', e.message);
-    res.status(500).json({ error: 'Erro ao criar usuario' });
-  }
+// Graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('\n[SERVER] Encerrando...');
+  await mongo.close();
+  process.exit(0);
 });
 
-// ===== PROTECTED DATA ROUTES =====
-
-app.get('/api/load', authMiddleware, (req, res) => {
-  try {
-    let data = loadFromFile();
-    if (!data) {
-      data = Object.assign({}, DEFAULT_DB);
-      data.users = [];
-      saveToFile(data);
-    }
-
-    if (req.user.type !== 'admin') {
-      delete data.activityLog;
-    }
-
-    res.json(data);
-  } catch (e) {
-    console.error('[ERRO] /api/load:', e.message);
-    res.status(500).json({ error: 'Erro ao carregar dados' });
-  }
+process.on('SIGTERM', async () => {
+  await mongo.close();
+  process.exit(0);
 });
 
-app.post('/api/save', authMiddleware, (req, res) => {
-  try {
-    const data = req.body;
-    if (!data || !data.products) {
-      return res.status(400).json({ error: 'Dados invalidos' });
-    }
-
-    if (req.user.type !== 'admin') {
-      if (data.settings) delete data.settings;
-      if (data.activityLog) delete data.activityLog;
-    }
-
-    const saved = saveToFile(data);
-    if (saved) {
-      res.json({ ok: true, message: 'Dados salvos com sucesso' });
-    } else {
-      res.status(500).json({ error: 'Erro ao salvar arquivo' });
-    }
-  } catch (e) {
-    console.error('[ERRO] /api/save:', e.message);
-    res.status(500).json({ error: 'Erro ao salvar dados' });
-  }
-});
-
-app.get('/api/users', authMiddleware, adminOnly, (req, res) => {
-  try {
-    let data = loadFromFile();
-    if (!data || !data.users) return res.json([]);
-    const safeUsers = data.users.map(u => removePassword(u));
-    res.json(safeUsers);
-  } catch (e) {
-    res.status(500).json({ error: 'Erro ao listar usuarios' });
-  }
-});
-
-app.put('/api/users/:id', authMiddleware, adminOnly, async (req, res) => {
-  try {
-    const userId = parseInt(req.params.id);
-    const { name, type, active, password } = req.body;
-
-    let data = loadFromFile();
-    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
-
-    const user = (data.users || []).find(u => u.id === userId);
-    if (!user) return res.status(404).json({ error: 'Usuario nao encontrado' });
-
-    if (name) user.name = name;
-    if (type && ['admin', 'func', 'cliente'].includes(type)) user.type = type;
-    if (active !== undefined) user.active = active;
-    if (password && password.length >= 4) {
-      user.password = await bcrypt.hash(password, BCRYPT_ROUNDS);
-    }
-
-    saveToFile(data);
-    console.log(`[ADMIN] Usuario "${user.username}" atualizado por ${req.user.username}`);
-    res.json({ ok: true, user: removePassword(user) });
-  } catch (e) {
-    res.status(500).json({ error: 'Erro ao atualizar usuario' });
-  }
-});
-
-app.delete('/api/users/:id', authMiddleware, adminOnly, (req, res) => {
-  try {
-    const userId = parseInt(req.params.id);
-    let data = loadFromFile();
-    if (!data) return res.status(500).json({ error: 'Dados nao encontrados' });
-
-    const user = (data.users || []).find(u => u.id === userId);
-    if (!user) return res.status(404).json({ error: 'Usuario nao encontrado' });
-    if (user.id === req.user.id) return res.status(400).json({ error: 'Nao e possivel excluir seu proprio usuario' });
-
-    user.active = false;
-    saveToFile(data);
-    console.log(`[ADMIN] Usuario "${user.username}" desativado por ${req.user.username}`);
-    res.json({ ok: true, message: 'Usuario desativado' });
-  } catch (e) {
-    res.status(500).json({ error: 'Erro ao excluir usuario' });
-  }
-});
-
-app.delete('/api/reset', authMiddleware, adminOnly, (req, res) => {
-  try {
-    const data = Object.assign({}, DEFAULT_DB);
-    data.users = [];
-    saveToFile(data);
-    initDefaultUsers();
-    console.log(`[ADMIN] Dados resetados por ${req.user.username}`);
-    res.json({ ok: true, message: 'Dados resetados para padrao' });
-  } catch (e) {
-    res.status(500).json({ error: 'Erro ao resetar dados' });
-  }
-});
-
-// ===== API INFO (sem static files) =====
-
-app.get('/', (req, res) => {
-  res.json({
-    name: 'PetShop Prado API',
-    version: '2.1.0',
-    status: 'online',
-    endpoints: {
-      public: {
-        status: 'GET /api/status',
-        login: 'POST /api/auth/login',
-        validate: 'POST /api/auth/validate'
-      },
-      protected: {
-        load: 'GET /api/load',
-        save: 'POST /api/save',
-        changePassword: 'POST /api/auth/change-password'
-      },
-      admin: {
-        createUser: 'POST /api/auth/create-user',
-        listUsers: 'GET /api/users',
-        editUser: 'PUT /api/users/:id',
-        disableUser: 'DELETE /api/users/:id',
-        reset: 'DELETE /api/reset'
-      }
-    }
-  });
-});
-
-// ===== START =====
-
-const server = initDefaultUsers().then(() => {
-  const instance = app.listen(PORT, '0.0.0.0', () => {
-    console.log('========================================');
-    console.log('   PetShop Prado - API v2.1.0');
-    console.log('========================================');
-    console.log(`Porta: ${PORT}`);
-    console.log(`DB: ${DB_FILE}`);
-    console.log(`Ambiente: ${process.env.NODE_ENV || 'desenvolvimento'}`);
-    console.log('========================================');
-  });
-
-  // Graceful Shutdown
-  const shutdown = async (signal) => {
-    console.log(`\n[${signal}] Encerrando servidor...`);
-    instance.close(() => {
-      console.log('[OK] Servidor encerrado graciosamente');
-      process.exit(0);
-    });
-
-    setTimeout(() => {
-      console.error('[FATAL] Forcando encerramento');
-      process.exit(1);
-    }, 10000);
-  };
-
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('SIGINT', () => shutdown('SIGINT'));
-
-  return instance;
-}).catch(e => {
-  console.error('[FATAL] Erro ao inicializar:', e);
-  process.exit(1);
-});
+start();

@@ -1,17 +1,16 @@
 services:
   - type: web
     name: petshop-prado
-    env: node
+    runtime: node
     plan: free
     buildCommand: npm install
     startCommand: node server.js
-    healthCheckPath: /api/status
     envVars:
+      - key: MONGO_MODE
+        value: atlas
+      - key: MONGO_DB_NAME
+        value: petshop_prado
+      - key: MONGO_ATLAS_URI
+        sync: false
       - key: NODE_ENV
         value: production
-      - key: JWT_SECRET
-        value: petshop-prado-minha-senha-secreta-2024
-    disks:
-      - name: petshop-data
-        mountPath: /opt/render/project/src/data
-        sizeGB: 1
